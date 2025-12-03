@@ -343,7 +343,7 @@ def build_invoice_jwt(description: str, amount: float, item_name: str):
     ВАЖНО:
     - Quantity — целое число (1, а не 1.0)
     - MerchantComments не передаём, если он пустой
-    - Signature: HMAC(MD5) по (header_b64.payload_b64), затем Base64 от сырых байт HMAC
+    - Signature: HMAC(MD5) по (header_b64.payload_b64), затем Base64Url без паддинга
     """
     if not MERCHANT_LOGIN or not PASSWORD1:
         raise RuntimeError("Не заданы MerchantLogin / Password1 в настройках Robokassa.")
@@ -384,9 +384,9 @@ def build_invoice_jwt(description: str, amount: float, item_name: str):
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
     key = f"{MERCHANT_LOGIN}:{PASSWORD1}".encode("utf-8")
 
-    # HMAC(MD5) → сырые байты → Base64
+    # HMAC(MD5) → сырые байты → Base64Url без паддинга
     hmac_bytes = hmac.new(key, signing_input, hashlib.md5).digest()
-    signature_b64 = base64.b64encode(hmac_bytes).decode("ascii")  # с '==' в конце
+    signature_b64 = base64.urlsafe_b64encode(hmac_bytes).decode("ascii").rstrip("=")
 
     token = f"{header_b64}.{payload_b64}.{signature_b64}"
     return token, header_obj, payload_obj, header_b64, payload_b64
