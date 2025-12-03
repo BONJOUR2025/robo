@@ -1,0 +1,17 @@
+{
+  "merchant_login": "BonjourSPB",
+  "password1": "Bonjour-1",
+  "password2": "Bonjour-2",
+  "shop_sno": "patent",
+  "tax": "none",
+  "customer_email": "example@example.com",
+  "is_test": 0,
+  "telegram_token": "7757706819:AAFzCAQxl9tIMlgw-vCOBDzqDzslffRBUMA",
+  "admin_id": "5495663985",
+  "user_chat_id": "5495663985",
+  "result_port": "8085",
+  "fb_db_path": "C:/Agbis/DB/ARM_13.fdb",
+  "fb_user": "SYSDBA",
+  "fb_password": "masterkey",
+  "fb_encoding": "WIN1251"
+}

@@ -1,0 +1,5 @@
+qrcode[pil]
+python-telegram-bot>=20,<21
+Flask
+requests
+fdb
