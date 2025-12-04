@@ -3,12 +3,12 @@
 """
 BONJOUR — локальное приложение для выставления счётов через Robokassa.
 
-Теперь всё замкнуто внутри desktop_app:
-- Robokassa-настройки (логин, пароли, СНО, НДС, email).
+- Настройки Robokassa (логин, пароли, СНО, НДС, email).
 - SQLite-база payments.sqlite3.
 - Встроенный ResultURL-сервер на aiohttp (порт по умолчанию 8085).
 - Отправка QR и ссылки в Telegram по user_chat_id.
-- Создание счетов через Invoice API (JWT) с минимальным набором данных.
+- Создание счетов через Invoice API (JWT).
+- Онлайн-проверка статуса платежа через WebService OpStateExt.
 """
 
 import json
@@ -16,12 +16,12 @@ import base64
 import sqlite3
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
 import threading
 import asyncio
 import hmac
 import hashlib
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS payments (
     services TEXT NOT NULL,
     amount REAL NOT NULL,
     payment_url TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    invoice_id INTEGER
 );
 """
 
@@ -72,7 +73,6 @@ COLOR_ACCENT_DARK = "#D97706"
 COLOR_ENTRY_BG = "#020617"
 COLOR_ENTRY_BORDER = "#1F2937"
 COLOR_TABLE_BG = "#020617"
-COLOR_TABLE_ALT_BG = "#020617"
 COLOR_TABLE_BORDER = "#1F2937"
 COLOR_TABLE_HEADER_BG = "#111827"
 COLOR_TABLE_HEADER_FG = "#E5E7EB"
@@ -181,7 +181,12 @@ def get_db():
 def init_db():
     conn = get_db()
     conn.executescript(CREATE_TABLE_SQL)
-    conn.commit()
+    # миграция: добавляем колонку invoice_id, если её не было
+    try:
+        conn.execute("ALTER TABLE payments ADD COLUMN invoice_id INTEGER")
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
 
 
@@ -193,13 +198,16 @@ def insert_payment(
     amount: float,
     payment_url: str,
     status: str = "created",
+    invoice_id: int | None = None,
 ):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO payments (created_at, tg_user_id, tg_username, order_number, services, amount, payment_url, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO payments
+            (created_at, tg_user_id, tg_username, order_number,
+             services, amount, payment_url, status, invoice_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -210,6 +218,7 @@ def insert_payment(
             amount,
             payment_url,
             status,
+            invoice_id,
         ),
     )
     conn.commit()
@@ -239,7 +248,7 @@ def get_last_payment(order_number: str):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, created_at, amount, status, tg_username, tg_user_id
+        SELECT id, created_at, amount, status, tg_username, tg_user_id, invoice_id
         FROM payments
         WHERE order_number = ?
         ORDER BY id DESC
@@ -252,6 +261,28 @@ def get_last_payment(order_number: str):
     return row
 
 
+def get_recent_payments_for_order(order_number: str, limit: int = 3):
+    """
+    Возвращает до `limit` последних платежей по заказу (id DESC).
+    """
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT id, created_at, amount, status, tg_username, tg_user_id, invoice_id
+        FROM payments
+        WHERE order_number = ?
+        ORDER BY id DESC
+        LIMIT {int(limit)}
+        """,
+        (order_number,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 def get_payments(filter_order: str = ""):
     conn = get_db()
     conn.row_factory = sqlite3.Row
@@ -260,7 +291,8 @@ def get_payments(filter_order: str = ""):
     if filter_order:
         cur.execute(
             """
-            SELECT id, created_at, order_number, services, amount, status, tg_username, tg_user_id, payment_url
+            SELECT id, created_at, order_number, services, amount, status,
+                   tg_username, tg_user_id, payment_url, invoice_id
             FROM payments
             WHERE order_number LIKE ?
             ORDER BY id DESC
@@ -270,7 +302,8 @@ def get_payments(filter_order: str = ""):
     else:
         cur.execute(
             """
-            SELECT id, created_at, order_number, services, amount, status, tg_username, tg_user_id, payment_url
+            SELECT id, created_at, order_number, services, amount, status,
+                   tg_username, tg_user_id, payment_url, invoice_id
             FROM payments
             ORDER BY id DESC
             """
@@ -281,9 +314,12 @@ def get_payments(filter_order: str = ""):
     return rows
 
 
-# ---------- Robokassa Invoice API (JWT) ----------
+# ---------- Robokassa Invoice API (JWT) + OpStateExt ----------
 
 INVOICE_API_URL = "https://services.robokassa.ru/InvoiceServiceWebApi/api/CreateInvoice"
+
+# ВАЖНО: именно auth.robokassa.ru, не roboxchange.com
+OPSTATE_URL = "https://auth.robokassa.ru/Merchant/WebService/Service.asmx/OpStateExt"
 
 
 def log_invoice_debug(header_obj, payload_obj, header_b64, payload_b64, token, body_text, response: requests.Response):
@@ -331,24 +367,10 @@ def log_invoice_debug(header_obj, payload_obj, header_b64, payload_b64, token, b
 def build_invoice_jwt(description: str, amount: float, item_name: str):
     """
     Формируем JWT-токен для Invoice API.
-
-    Минимально передаём:
-    - MerchantLogin
-    - InvoiceType="OneTime"
-    - Culture="ru"
-    - OutSum
-    - Description
-    - InvoiceItems: один агрегированный товар по сумме
-
-    ВАЖНО:
-    - Quantity — целое число (1, а не 1.0)
-    - MerchantComments не передаём, если он пустой
-    - Signature: HMAC(MD5) по (header_b64.payload_b64), затем Base64Url без паддинга
     """
     if not MERCHANT_LOGIN or not PASSWORD1:
         raise RuntimeError("Не заданы MerchantLogin / Password1 в настройках Robokassa.")
 
-    # Заголовок — строго как в документации: с alg="MD5"
     header_obj = {
         "typ": "JWT",
         "alg": "MD5",
@@ -365,7 +387,7 @@ def build_invoice_jwt(description: str, amount: float, item_name: str):
         "InvoiceItems": [
             {
                 "Name": item_name,
-                "Quantity": 1,              # ВАЖНО: целое число
+                "Quantity": 1,
                 "Cost": float(amount),
                 "Tax": tax_value,
                 "PaymentMethod": "full_payment",
@@ -374,7 +396,6 @@ def build_invoice_jwt(description: str, amount: float, item_name: str):
         ],
     }
 
-    # Base64Url для header/payload (без '=')
     header_json = json.dumps(header_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     payload_json = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -384,7 +405,6 @@ def build_invoice_jwt(description: str, amount: float, item_name: str):
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
     key = f"{MERCHANT_LOGIN}:{PASSWORD1}".encode("utf-8")
 
-    # HMAC(MD5) → сырые байты → Base64Url без паддинга
     hmac_bytes = hmac.new(key, signing_input, hashlib.md5).digest()
     signature_b64 = base64.urlsafe_b64encode(hmac_bytes).decode("ascii").rstrip("=")
 
@@ -392,10 +412,9 @@ def build_invoice_jwt(description: str, amount: float, item_name: str):
     return token, header_obj, payload_obj, header_b64, payload_b64
 
 
-def create_invoice_and_get_link(description: str, amount: float, item_name: str) -> str:
+def create_invoice_and_get_link(description: str, amount: float, item_name: str):
     """
-    Создаём счёт через Invoice API и возвращаем короткую ссылку на оплату.
-    ВАЖНО: тело запроса — JSON-строка, содержащая сам JWT-токен.
+    Создаём счёт через Invoice API и возвращаем (ссылка, invoice_id).
     """
     token, header_obj, payload_obj, header_b64, payload_b64 = build_invoice_jwt(
         description=description,
@@ -403,9 +422,7 @@ def create_invoice_and_get_link(description: str, amount: float, item_name: str)
         item_name=item_name,
     )
 
-    # Тело запроса: "<JWT>"
     body_text = json.dumps(token, ensure_ascii=False, separators=(",", ":"))
-
     headers = {
         "Content-Type": "application/json; charset=utf-8",
     }
@@ -420,7 +437,6 @@ def create_invoice_and_get_link(description: str, amount: float, item_name: str)
     except Exception as e:
         raise RuntimeError(f"Не удалось обратиться к Invoice API: {e}")
 
-    # Логируем полный запрос/ответ
     log_invoice_debug(
         header_obj, payload_obj, header_b64, payload_b64, token, body_text, resp
     )
@@ -445,13 +461,15 @@ def create_invoice_and_get_link(description: str, amount: float, item_name: str)
         or data.get("PaymentUrl")
     )
 
+    invoice_id = data.get("invId") or data.get("invoiceId") or data.get("InvoiceId")
+
     if not link:
         raise RuntimeError(
             "Не удалось найти ссылку в ответе Invoice API: "
             + json.dumps(data, ensure_ascii=False)
         )
 
-    return link
+    return link, invoice_id
 
 
 def build_qr_image_bytes(url: str) -> BytesIO:
@@ -460,6 +478,119 @@ def build_qr_image_bytes(url: str) -> BytesIO:
     img.save(bio, format="PNG")
     bio.seek(0)
     return bio
+
+
+def parse_opstate_xml(xml_text: str) -> dict:
+    """
+    Разбор XML-ответа OpStateExt.
+
+    Возвращает словарь с ключами:
+      - ResultCode, ResultDescription
+      - StateCode, RequestDate, StateDate
+      - IncCurrLabel, IncSum, IncAccount, PaymentMethodCode,
+        OutCurrLabel, OutSum, OpKey
+    """
+    text = xml_text.lstrip("\ufeff").strip()
+
+    try:
+        root = ET.fromstring(text)
+    except Exception as e:
+        raise RuntimeError(
+            f"Не удалось разобрать XML от OpState:\n{e}\n\nТело:\n{text[:2000]}"
+        )
+
+    # убираем namespace
+    for el in root.iter():
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+    result: dict[str, str] = {}
+
+    # Result
+    rc_el = root.find("Result/Code")
+    if rc_el is not None and rc_el.text:
+        result["ResultCode"] = rc_el.text.strip()
+
+    rd_el = root.find("Result/Description")
+    if rd_el is not None and rd_el.text:
+        result["ResultDescription"] = rd_el.text.strip()
+
+    # State
+    state_code_el = root.find("State/Code")
+    if state_code_el is not None and state_code_el.text:
+        result["StateCode"] = state_code_el.text.strip()
+    else:
+        state_el = root.find("State")
+        if state_el is not None and state_el.text and state_el.text.strip().isdigit():
+            result["StateCode"] = state_el.text.strip()
+
+    req_date_el = root.find("State/RequestDate")
+    if req_date_el is not None and req_date_el.text:
+        result["RequestDate"] = req_date_el.text.strip()
+
+    state_date_el = root.find("State/StateDate")
+    if state_date_el is not None and state_date_el.text:
+        result["StateDate"] = state_date_el.text.strip()
+
+    # Info
+    def grab(path: str, key: str):
+        el = root.find(path)
+        if el is not None and el.text:
+            result[key] = el.text.strip()
+
+    grab("Info/IncCurrLabel", "IncCurrLabel")
+    grab("Info/IncSum", "IncSum")
+    grab("Info/IncAccount", "IncAccount")
+    grab("Info/PaymentMethod/Code", "PaymentMethodCode")
+    grab("Info/OutCurrLabel", "OutCurrLabel")
+    grab("Info/OutSum", "OutSum")
+    grab("Info/OpKey", "OpKey")
+
+    return result
+
+
+def get_payment_state_by_inv_id(inv_id: int) -> dict:
+    """
+    Проверка статуса платежа через WebService OpStateExt по InvId.
+
+    Signature = MD5(MerchantLogin:InvoiceID:Password2)
+    """
+    if not MERCHANT_LOGIN or not PASSWORD2:
+        raise RuntimeError("Не заданы MerchantLogin / Password2 в настройках Robokassa.")
+
+    sig_src = f"{MERCHANT_LOGIN}:{inv_id}:{PASSWORD2}"
+    signature = hashlib.md5(sig_src.encode("utf-8")).hexdigest()
+
+    params = {
+        "MerchantLogin": MERCHANT_LOGIN,
+        "InvoiceID": str(inv_id),
+        "Signature": signature,
+    }
+
+    try:
+        resp = requests.get(OPSTATE_URL, params=params, timeout=20)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось обратиться к OpStateExt: {e}")
+
+    if not resp.ok:
+        raise RuntimeError(f"OpStateExt вернул HTTP {resp.status_code}: {resp.text[:500]}")
+
+    raw_bytes = resp.content
+    try:
+        xml_text = raw_bytes.decode("utf-8-sig")
+    except Exception:
+        xml_text = raw_bytes.decode("utf-8", errors="replace")
+
+    xml_text = xml_text.lstrip("\ufeff").strip()
+    if xml_text.startswith("ï»¿"):
+        xml_text = xml_text[3:]
+    first_lt = xml_text.find("<")
+    if first_lt > 0:
+        xml_text = xml_text[first_lt:]
+
+    info = parse_opstate_xml(xml_text)
+    info["_raw"] = xml_text
+    return info
 
 
 # ---------- Telegram отправка ----------
@@ -535,11 +666,13 @@ class ResultHandler:
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
 
+        buyer = f"@{row['tg_username']}" if row["tg_username"] else "(покупатель не указан)"
+
         text = (
             f"💸 Оплата получена\n"
-            f"Заказ: {row['id']}\n"
+            f"Заказ (ID записи): {row['id']}\n"
             f"Сумма: {row['amount']:.2f} руб.\n"
-            f"Покупатель: @{row['tg_username']}"
+            f"Покупатель: {buyer}"
         )
 
         try:
@@ -596,7 +729,8 @@ class App(tk.Tk):
         self.configure(bg=COLOR_BG)
 
         self.cfg = cfg
-        self.items = []
+        self.items: list[dict] = []
+        self._settings_window: tk.Toplevel | None = None
 
         try:
             self.iconphoto(False, tk.PhotoImage(file=str(LOGO_PATH)))
@@ -611,15 +745,15 @@ class App(tk.Tk):
 
         self.frame_main = ttk.Frame(self.notebook, padding=16)
         self.frame_payments = ttk.Frame(self.notebook, padding=16)
-        self.frame_settings = ttk.Frame(self.notebook, padding=16)
 
         self.notebook.add(self.frame_main, text="Выставление счёта")
-        self.notebook.add(self.frame_payments, text="Платежи")
-        self.notebook.add(self.frame_settings, text="Настройки")
+        self.notebook.add(self.frame_payments, text="Журнал платежей")
 
         self._build_main_tab()
         self._build_payments_tab()
-        self._build_settings_tab()
+
+        # Скрытые настройки: открываются только по Ctrl+Alt+S
+        self.bind_all("<Control-Alt-s>", self.open_settings_window)
 
     # ---------- Стили ----------
 
@@ -723,7 +857,7 @@ class App(tk.Tk):
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=0)
 
         # Левая часть — ввод заказа и позиций
-        lbl_title = ttk.Label(left, text="Новый счёт", font=("Segoe UI Semibold", 14))
+        lbl_title = ttk.Label(left, text="Новый счёт на оплату", font=("Segoe UI Semibold", 14))
         lbl_title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
         ttk.Label(left, text="Номер заказа:").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
@@ -733,7 +867,7 @@ class App(tk.Tk):
 
         btn_load = ttk.Button(
             left,
-            text="Загрузить из Firebird",
+            text="Загрузить услуги из программы",
             command=self.load_order_from_db,
         )
         btn_load.grid(row=1, column=2, padx=(8, 0), pady=4)
@@ -756,22 +890,10 @@ class App(tk.Tk):
         self.amount_entry = ttk.Entry(left, width=20)
         self.amount_entry.grid(row=3, column=1, sticky="w", pady=4)
 
-        ttk.Label(left, text="Telegram ID покупателя:").grid(
-            row=4, column=0, sticky="e", padx=(0, 8), pady=4
-        )
-        self.tg_user_id_entry = ttk.Entry(left, width=20)
-        self.tg_user_id_entry.grid(row=4, column=1, sticky="w", pady=4)
-
-        ttk.Label(left, text="Telegram username (@):").grid(
-            row=5, column=0, sticky="e", padx=(0, 8), pady=4
-        )
-        self.tg_username_entry = ttk.Entry(left, width=20)
-        self.tg_username_entry.grid(row=5, column=1, sticky="w", pady=4)
-
         # Позиции
         items_frame = ttk.LabelFrame(left, text="Позиции чека", padding=8)
-        items_frame.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
-        left.grid_rowconfigure(6, weight=1)
+        items_frame.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
+        left.grid_rowconfigure(4, weight=1)
 
         self.items_listbox = tk.Listbox(
             items_frame,
@@ -792,18 +914,18 @@ class App(tk.Tk):
         btn_col = ttk.Frame(items_frame)
         btn_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
 
-        ttk.Button(btn_col, text="Добавить", command=self.add_item_dialog).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_col, text="Изменить", command=self.edit_selected_item).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_col, text="Удалить", command=self.delete_selected_item).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_col, text="Добавить позицию", command=self.add_item_dialog).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_col, text="Изменить позицию", command=self.edit_selected_item).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_col, text="Удалить позицию", command=self.delete_selected_item).pack(fill=tk.X, pady=2)
 
         # Кнопка создания счёта
         btn_create = ttk.Button(
             left,
-            text="Создать счёт (Invoice API) и отправить в Telegram",
+            text="Сформировать ссылку и QR для оплаты",
             style="Accent.TButton",
             command=self.generate_payment,
         )
-        btn_create.grid(row=7, column=0, columnspan=3, sticky="we", pady=(12, 0))
+        btn_create.grid(row=5, column=0, columnspan=3, sticky="we", pady=(12, 0))
 
         # Правая часть — проверка статуса, подсказки
         right.grid_columnconfigure(0, weight=1)
@@ -822,15 +944,15 @@ class App(tk.Tk):
 
         ttk.Button(
             block,
-            text="Проверить статус",
-            command=self.check_payment_status,
+            text="Проверить статус оплаты онлайн",
+            command=self.check_online_status,
         ).grid(row=0, column=2, padx=(8, 0), pady=4)
 
         hint = ttk.Label(
             right,
-            text="После успешной оплаты Robokassa вызовет ResultURL и статус\n"
-                 "платежа обновится в локальной базе. Здесь можно быстро\n"
-                 "проверить текущий статус по номеру заказа.",
+            text="После успешной оплаты Robokassa автоматически обновит статус.\n"
+                 "Здесь можно запросить онлайн-статус по номеру заказа\n"
+                 "(проверяются последние платежи по этому заказу).",
             style="Muted.TLabel",
             justify="left",
         )
@@ -970,7 +1092,7 @@ class App(tk.Tk):
             messagebox.showwarning(
                 "База данных",
                 "Не указан путь к .fdb или логин в настройках.\n"
-                "Откройте «Настройки» и заполните раздел Firebird.",
+                "Откройте скрытые настройки (Ctrl+Alt+S) и заполните раздел Firebird.",
             )
             return
 
@@ -994,20 +1116,37 @@ class App(tk.Tk):
                 charset="WIN1251",
             )
             cur = conn.cursor()
+
+            # Объединённый запрос: услуги + строки заказа, без истории/контрагента,
+            # чтобы не было дублей
             sql = """
-                select
-                    tovars_tbl.name,
-                    doc_order_services.kredit
-                from docs_order
-                   inner join doc_order_services
-                        on docs_order.id = doc_order_services.doc_order_id
-                   inner join tovars_tbl
-                        on doc_order_services.tovar_id = tovars_tbl.tovar_id
-                   inner join docs
-                        on docs_order.doc_id = docs.doc_id
-                where docs.doc_num = ?
+                SELECT
+                    t1.name,
+                    s.kredit
+                FROM docs_order o1
+                    INNER JOIN doc_order_services s
+                        ON o1.id = s.doc_order_id
+                    INNER JOIN tovars_tbl t1
+                        ON s.tovar_id = t1.tovar_id
+                    INNER JOIN docs d1
+                        ON o1.doc_id = d1.doc_id
+                WHERE d1.doc_num = ?
+
+                UNION ALL
+
+                SELECT
+                    t2.name,
+                    l.kredit
+                FROM doc_order_lines l
+                    INNER JOIN docs_order o2
+                        ON l.doc_order_id = o2.id
+                    INNER JOIN docs d2
+                        ON o2.doc_id = d2.doc_id
+                    INNER JOIN tovars_tbl t2
+                        ON l.tovar_id = t2.tovar_id
+                WHERE d2.doc_num = ?
             """
-            cur.execute(sql, (order_number,))
+            cur.execute(sql, (order_number, order_number))
             rows = cur.fetchall()
 
             if not rows:
@@ -1072,30 +1211,19 @@ class App(tk.Tk):
             messagebox.showerror("Сумма", str(e))
             return
 
-        tg_user_id_text = self.tg_user_id_entry.get().strip()
-        tg_username = self.tg_username_entry.get().strip().lstrip("@")
-
-        if tg_user_id_text:
-            try:
-                tg_user_id = int(tg_user_id_text)
-            except Exception:
-                messagebox.showerror(
-                    "Telegram ID",
-                    "Telegram ID должен быть целым числом.",
-                )
-                return
-        else:
-            tg_user_id = APP_CONFIG.get("user_chat_id") or 0
+        # Телеграм клиента/ID не спрашиваем — используем дефолт из настроек
+        tg_username = ""
+        tg_user_id = APP_CONFIG.get("user_chat_id") or 0
 
         try:
-            payment_url = create_invoice_and_get_link(
+            payment_url, invoice_id = create_invoice_and_get_link(
                 description=f"Заказ №{order_number}",
                 amount=amount,
                 item_name=services[:100],
             )
         except Exception as e:
             messagebox.showerror(
-                "Invoice API",
+                "Создание счёта",
                 f"Ошибка при создании счёта через Invoice API:\n{e}",
             )
             return
@@ -1109,6 +1237,7 @@ class App(tk.Tk):
                 amount=amount,
                 payment_url=payment_url,
                 status="created",
+                invoice_id=invoice_id if invoice_id is not None else None,
             )
         except Exception as e:
             messagebox.showerror(
@@ -1125,9 +1254,11 @@ class App(tk.Tk):
 
         messagebox.showinfo(
             "Счёт создан",
-            "Счёт успешно создан через Invoice API.\n"
+            "Ссылка и QR-код успешно сформированы.\n"
             "QR-код и ссылка отправлены в Telegram.",
         )
+
+    # ---------- Локальная проверка (оставлена как вспомогательная, без кнопки) ----------
 
     def check_payment_status(self):
         order_number = getattr(self, "check_order_entry", None)
@@ -1166,6 +1297,109 @@ class App(tk.Tk):
         )
         messagebox.showinfo("Статус оплаты", msg)
 
+    # ---------- Онлайн-статус (OpStateExt, до 3 платежей) ----------
+
+    def check_online_status(self):
+        """Онлайн-статус платежа через Robokassa OpStateExt по последним 3 платежам заказа."""
+        order_number = self.check_order_entry.get().strip()
+        if not order_number:
+            messagebox.showwarning(
+                "Статус оплаты",
+                "Введите номер заказа для проверки."
+            )
+            return
+
+        # 1. Берём до 3 последних записей из локальной БД
+        try:
+            rows = get_recent_payments_for_order(order_number, limit=3)
+        except Exception as e:
+            messagebox.showerror(
+                "Статус оплаты",
+                f"Не удалось обратиться к базе данных:\n{e}",
+            )
+            return
+
+        if not rows:
+            messagebox.showinfo(
+                "Статус оплаты",
+                f"Заказ {order_number} не найден в локальной базе.",
+            )
+            return
+
+        # Справочник кодов в человеко-читаемый статус
+        state_map = {
+            "5": "ожидает оплаты",
+            "10": "отменён, деньги не получены",
+            "20": "средства заморожены (HOLD)",
+            "50": "деньги получены, зачисляются",
+            "60": "отказ в зачислении / возврат",
+            "80": "исполнение приостановлено",
+            "100": "успешно оплачено",
+        }
+
+        def format_dt(dt_str: str | None) -> str:
+            if not dt_str:
+                return ""
+            dt_str = dt_str.strip()
+            # пробуем ISO-формат
+            try:
+                # отрезаем лишние микросекунды/зону, если что
+                if dt_str.endswith("Z"):
+                    dt_str_local = dt_str.replace("Z", "+00:00")
+                else:
+                    dt_str_local = dt_str
+                dt = datetime.fromisoformat(dt_str_local)
+                return dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                # пробуем формат локальной БД
+                try:
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                    return dt.strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    return dt_str
+
+        lines: list[str] = []
+        lines.append(f"Заказ №{order_number}")
+        lines.append("")
+
+        any_online = False
+
+        for idx, row in enumerate(rows, start=1):
+            invoice_id = row["invoice_id"]
+            local_created = row["created_at"] or ""
+            local_amount = row["amount"] or 0.0
+
+            if not invoice_id:
+                status_text = "нет данных об онлайн-статусе (InvId не сохранён)"
+                dt_text = format_dt(local_created)
+            else:
+                try:
+                    info = get_payment_state_by_inv_id(int(invoice_id))
+                    state_code = info.get("StateCode")
+                    state_text = state_map.get(state_code or "", "статус не определён")
+                    dt_text = format_dt(info.get("StateDate") or local_created)
+                    status_text = state_text
+                    any_online = True
+                except Exception as e:
+                    dt_text = format_dt(local_created)
+                    status_text = f"ошибка при запросе статуса: {e}"
+
+            amount_text = f"{float(local_amount):.2f} руб."
+            dt_part = dt_text if dt_text else "дата не указана"
+
+            lines.append(
+                f"{idx}. Платёж: {dt_part} — {amount_text} — {status_text}"
+            )
+
+        if not any_online:
+            lines.append("")
+            lines.append("Онлайн-данные Robokassa недоступны (нет InvId или запрос завершился ошибкой).")
+
+        messagebox.showinfo(
+            "Статус оплаты",
+            "\n".join(lines),
+        )
+
     # ---------- Вкладка "Платежи" ----------
 
     def _build_payments_tab(self):
@@ -1180,13 +1414,13 @@ class App(tk.Tk):
 
         ttk.Button(
             top,
-            text="Применить",
+            text="Применить фильтр",
             command=self.refresh_payments,
         ).pack(side=tk.LEFT)
 
         ttk.Button(
             top,
-            text="Экспорт в CSV",
+            text="Экспортировать в CSV",
             command=self.export_payments_csv,
         ).pack(side=tk.RIGHT)
 
@@ -1263,6 +1497,7 @@ class App(tk.Tk):
                         "TG username",
                         "TG user id",
                         "Ссылка на оплату",
+                        "InvoiceID",
                     ]
                 )
                 for row in rows:
@@ -1277,13 +1512,37 @@ class App(tk.Tk):
                             row["tg_username"],
                             row["tg_user_id"],
                             row["payment_url"],
+                            row["invoice_id"] if row["invoice_id"] is not None else "",
                         ]
                     )
             messagebox.showinfo("Экспорт", "Платежи успешно сохранены в CSV.")
         except Exception as e:
             messagebox.showerror("Экспорт", f"Ошибка при сохранении CSV:\n{e}")
 
-    # ---------- Вкладка "Настройки" ----------
+    # ---------- Настройки (скрытое окно, вызывается по Ctrl+Alt+S) ----------
+
+    def open_settings_window(self, event=None):
+        # если уже открыто — поднимаем окно
+        if self._settings_window is not None and self._settings_window.winfo_exists():
+            self._settings_window.lift()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Настройки")
+        win.geometry("800x600")
+        win.configure(bg=COLOR_BG)
+        self._settings_window = win
+
+        self.frame_settings = ttk.Frame(win, padding=16)
+        self.frame_settings.pack(fill=tk.BOTH, expand=True)
+
+        self._build_settings_tab()
+
+        def on_close():
+            self._settings_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def _build_settings_tab(self):
         frame = self.frame_settings
@@ -1464,7 +1723,6 @@ class App(tk.Tk):
 
         save_config(cfg)
         messagebox.showinfo("Настройки", "Настройки сохранены.")
-
 
 # ---------- Splash и запуск ----------
 
